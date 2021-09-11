@@ -1,0 +1,167 @@
+Only in igc/: .built-in.o.cmd
+Only in igc/: .igc_base.o.cmd
+Only in igc/: .igc_i225.o.cmd
+Only in igc/: .igc.ko.cmd
+Only in igc/: .igc_mac.o.cmd
+diff -u -r /mnt/igc/igc_main.c igc/igc_main.c
+--- /mnt/igc/igc_main.c	2021-09-11 07:04:16.492886000 +0100
++++ igc/igc_main.c	2021-09-11 17:59:06.678990022 +0100
+@@ -344,14 +344,11 @@
+ 					      DMA_FROM_DEVICE);
+ 
+ 		/* free resources associated with mapping */
+-		dma_unmap_page_attrs(rx_ring->dev,
++		dma_unmap_page(rx_ring->dev,
+ 				     buffer_info->dma,
+ 				     igc_rx_pg_size(rx_ring),
+-				     DMA_FROM_DEVICE,
+-				     IGC_RX_DMA_ATTR);
+-		__page_frag_cache_drain(buffer_info->page,
+-					buffer_info->pagecnt_bias);
+-
++				     DMA_FROM_DEVICE);
++		__free_page(buffer_info->page);
+ 		i++;
+ 		if (i == rx_ring->count)
+ 			i = 0;
+@@ -1311,11 +1308,10 @@
+ 		/* We are not reusing the buffer so unmap it and free
+ 		 * any references we are holding to it
+ 		 */
+-		dma_unmap_page_attrs(rx_ring->dev, rx_buffer->dma,
+-				     igc_rx_pg_size(rx_ring), DMA_FROM_DEVICE,
+-				     IGC_RX_DMA_ATTR);
+-		__page_frag_cache_drain(rx_buffer->page,
+-					rx_buffer->pagecnt_bias);
++		dma_unmap_page(rx_ring->dev, rx_buffer->dma,
++				     igc_rx_pg_size(rx_ring), 
++				     DMA_FROM_DEVICE);
++		__free_page(rx_buffer->page);
+ 	}
+ 
+ 	/* clear contents of rx_buffer */
+@@ -1505,10 +1501,9 @@
+ 	}
+ 
+ 	/* map page for use */
+-	dma = dma_map_page_attrs(rx_ring->dev, page, 0,
++	dma = dma_map_page(rx_ring->dev, page, 0,
+ 				 igc_rx_pg_size(rx_ring),
+-				 DMA_FROM_DEVICE,
+-				 IGC_RX_DMA_ATTR);
++				 DMA_FROM_DEVICE);
+ 
+ 	/* if mapping failed free memory back to system since
+ 	 * there isn't much point in holding memory we can't use
+@@ -1765,7 +1760,7 @@
+ 	igc_nfc_filter_exit(adapter);
+ 
+ 	/* set trans_start so we don't get spurious watchdogs during reset */
+-	netif_trans_update(netdev);
++	netdev->trans_start = jiffies;	
+ 
+ 	netif_carrier_off(netdev);
+ 	netif_tx_stop_all_queues(netdev);
+@@ -2287,9 +2282,9 @@
+ /* Need to wait a few seconds after link up to get diagnostic information from
+  * the phy
+  */
+-static void igc_update_phy_info(struct timer_list *t)
++static void igc_update_phy_info(unsigned long data)
+ {
+-	struct igc_adapter *adapter = from_timer(adapter, t, phy_info_timer);
++	struct igc_adapter *adapter = (struct igc_adapter *)data;
+ 
+ 	igc_get_phy_info(&adapter->hw);
+ }
+@@ -2337,9 +2332,10 @@
+  * igc_watchdog - Timer Call-back
+  * @data: pointer to adapter cast into an unsigned long
+  */
+-static void igc_watchdog(struct timer_list *t)
++static void igc_watchdog(unsigned long data)
+ {
+-	struct igc_adapter *adapter = from_timer(adapter, t, watchdog_timer);
++	struct igc_adapter *adapter = (struct igc_adapter *)data;
++	
+ 	/* Do the rest outside of interrupt context */
+ 	schedule_work(&adapter->watchdog_task);
+ }
+@@ -2855,10 +2851,10 @@
+ 	/* Exit the polling mode, but don't re-enable interrupts if stack might
+ 	 * poll us due to busy-polling
+ 	 */
+-	if (likely(napi_complete_done(napi, work_done)))
+-		igc_ring_irq_enable(q_vector);
++	napi_complete(napi);
++	igc_ring_irq_enable(q_vector);
+ 
+-	return min(work_done, budget - 1);
++	return 0;
+ }
+ 
+ /**
+@@ -3612,8 +3608,8 @@
+ 		goto err_sw_init;
+ 
+ 	/* MTU range: 68 - 9216 */
+-	netdev->min_mtu = ETH_MIN_MTU;
+-	netdev->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;
++	/*netdev->min_mtu = ETH_MIN_MTU;
++	netdev->max_mtu = MAX_STD_JUMBO_FRAME_SIZE;*/
+ 
+ 	/* before reading the NVM, reset the controller to put the device in a
+ 	 * known good starting state
+@@ -3638,8 +3634,8 @@
+ 	wr32(IGC_RXPBS, I225_RXPBSIZE_DEFAULT);
+ 	wr32(IGC_TXPBS, I225_TXPBSIZE_DEFAULT);
+ 
+-	timer_setup(&adapter->watchdog_timer, igc_watchdog, 0);
+-	timer_setup(&adapter->phy_info_timer, igc_update_phy_info, 0);
++	setup_timer(&adapter->watchdog_timer, igc_watchdog, (unsigned long)adapter);
++	setup_timer(&adapter->phy_info_timer, igc_update_phy_info, (unsigned long)adapter);
+ 
+ 	INIT_WORK(&adapter->reset_task, igc_reset_task);
+ 	INIT_WORK(&adapter->watchdog_task, igc_watchdog_task);
+@@ -3672,7 +3668,7 @@
+ 	adapter->ei = *ei;
+ 
+ 	/* print pcie link status and MAC address */
+-	pcie_print_link_status(pdev);
++	//pcie_print_link_status(pdev);
+ 	netdev_info(netdev, "MAC: %pM\n", netdev->dev_addr);
+ 
+ 	return 0;
+@@ -3726,7 +3722,10 @@
+ 
+ 	igc_clear_interrupt_scheme(adapter);
+ 	pci_iounmap(pdev, adapter->io_addr);
+-	pci_release_mem_regions(pdev);
++
++	pci_release_selected_regions(pdev,
++		pci_select_bars(pdev, IORESOURCE_MEM));
++
+ 
+ 	kfree(adapter->mac_table);
+ 	kfree(adapter->shadow_vfta);
+Only in igc/: .igc_main.o.cmd
+Only in igc/: igc.mod.c
+Only in igc/: .igc.mod.o.cmd
+Only in igc/: .igc_nvm.o.cmd
+Only in igc/: .igc.o.cmd
+Only in igc/: .igc_phy.o.cmd
+diff -u -r /mnt/igc/Makefile igc/Makefile
+--- /mnt/igc/Makefile	2021-09-11 07:04:16.488886000 +0100
++++ igc/Makefile	2021-09-11 06:21:12.021201420 +0100
+@@ -5,6 +5,7 @@
+ # Intel(R) I225-LM/I225-V 2.5G Ethernet Controller
+ #
+ 
+-obj-$(CONFIG_IGC) += igc.o
+ 
+ igc-objs := igc_main.o igc_mac.o igc_i225.o igc_base.o igc_nvm.o igc_phy.o
++
++obj-m += igc.o 
+Only in igc/: modules.order
+Only in igc/: Module.symvers
+Only in igc/: .tmp_versions
